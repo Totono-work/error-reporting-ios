@@ -12,6 +12,21 @@ reporter.capture(error)
 
 The SDK sends reports to Totono automatically. The public, write-only project key can be embedded in your app. Handled errors and breadcrumbs are queued locally on iOS, macOS, and Linux. On iOS and macOS, KSCrash writes native reports to disk and the SDK converts them on next launch. Test fatal crash delivery on a physical device outside the debugger. The SDK submits selected frames and binary metadata instead of the raw KSCrash file. Do not install another process crash handler alongside KSCrash.
 
+## Upload dSYMs for symbolication
+
+Set Xcode's **Debug Information Format** to **DWARF with dSYM File** for release builds. Use the dSYMs from the `.xcarchive` for the build you distribute. Set `TOTONO_ERROR_ARTIFACT_KEY` to the project's artifact key as a secret in your release environment.
+
+On a Mac with Node.js and npm, run the uploader from `@totono/error-reporting`. Give it the Mach-O file inside the `.dSYM` bundle and the UUID and architecture shown by `dwarfdump`.
+
+```sh
+DWARF_FILE="MyApp.xcarchive/dSYMs/MyApp.app.dSYM/Contents/Resources/DWARF/MyApp"
+xcrun dwarfdump --uuid "$DWARF_FILE"
+
+# Set UUID to the value shown for arm64 above.
+npx --package @totono/error-reporting totono-error-artifact dsym "$DWARF_FILE" "$UUID" arm64
+```
+
+Repeat the upload for each app or framework binary you want to symbolicate and each architecture you distribute. Totono matches crash frames to debug files by binary UUID and architecture.
 
 ## Raspberry Pi and other Linux hosts
 
