@@ -12,7 +12,7 @@ import KSCrashRecording
 @MainActor
 public final class ErrorReporter {
     public enum ConfigurationError: Error {
-        case invalidEndpoint, invalidKey
+        case invalidKey
     }
 
     private struct Entry: Codable {
@@ -21,7 +21,7 @@ public final class ErrorReporter {
         let body: Data
     }
 
-    private let endpoint: URL
+    private static let ingestionEndpoint = URL(string: "https://totono.work/api/public/error-reporting/v1/events")!
     private let key: String
     private let release: String
     private let build: String
@@ -37,27 +37,21 @@ public final class ErrorReporter {
     private var sending = false
 
     public init(
-        origin: URL,
         key: String,
         environment: String = "production",
         release: String? = nil,
         build: String? = nil,
         shouldSend: @escaping ([String: Any]) -> Bool = { _ in true }
     ) throws {
-        guard origin.scheme == "https", origin.host != nil, origin.user == nil, origin.password == nil,
-              let url = URL(string: "/api/public/error-reporting/v1/events", relativeTo: origin)?.absoluteURL else {
-            throw ConfigurationError.invalidEndpoint
-        }
         guard key.range(of: "^ttr_[A-Za-z0-9_-]{43}$", options: .regularExpression) != nil else {
             throw ConfigurationError.invalidKey
         }
-        endpoint = url
         self.key = key
         self.environment = Self.clean(environment, limit: 64)
         let releaseName = Self.clean(release ?? (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "", limit: 100)
         self.release = releaseName.isEmpty ? "unknown" : releaseName
         self.build = Self.clean(build ?? (Bundle.main.infoDictionary?["CFBundleVersion"] as? String) ?? "", limit: 100)
-        let scope = SHA256.hash(data: Data((url.absoluteString + key).utf8)).prefix(12).map { String(format: "%02x", $0) }.joined()
+        let scope = SHA256.hash(data: Data((Self.ingestionEndpoint.absoluteString + key).utf8)).prefix(12).map { String(format: "%02x", $0) }.joined()
         let directory = try Self.queueDirectory(scope: scope)
         file = directory.appendingPathComponent("queue.json")
         self.shouldSend = shouldSend
@@ -291,7 +285,7 @@ public final class ErrorReporter {
         persist()
         for _ in 0..<10 {
             guard let entry = entries.first else { return }
-            var request = URLRequest(url: endpoint)
+            var request = URLRequest(url: Self.ingestionEndpoint)
             request.httpMethod = "POST"
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.setValue(key, forHTTPHeaderField: "X-Totono-Error-Key")
