@@ -16,17 +16,49 @@ The SDK sends reports to Totono automatically. The public, write-only project ke
 
 Set Xcode's **Debug Information Format** to **DWARF with dSYM File** for release builds. Use the dSYMs from the `.xcarchive` for the build you distribute. Set `TOTONO_ERROR_ARTIFACT_KEY` to the project's artifact key as a secret in your release environment.
 
-On a Mac with Node.js and npm, run the uploader from `@totono/error-reporting`. Give it the Mach-O file inside the `.dSYM` bundle and the UUID and architecture shown by `dwarfdump`.
+Run `scripts/upload-dsym.sh` from a checkout of this SDK on your Mac or CI runner. The script uses Bash, `curl`, and `jq`. Give it the Mach-O file inside the `.dSYM` bundle and the UUID and architecture shown by `dwarfdump`.
 
 ```sh
 DWARF_FILE="MyApp.xcarchive/dSYMs/MyApp.app.dSYM/Contents/Resources/DWARF/MyApp"
 xcrun dwarfdump --uuid "$DWARF_FILE"
 
 # Set UUID to the value shown for arm64 above.
-npx --package @totono/error-reporting totono-error-artifact dsym "$DWARF_FILE" "$UUID" arm64
+bash scripts/upload-dsym.sh "$DWARF_FILE" "$UUID" arm64
 ```
 
 Repeat the upload for each app or framework binary you want to symbolicate and each architecture you distribute. Totono matches crash frames to debug files by binary UUID and architecture.
+
+### Automate uploads in CI
+
+Run a Bash step on your macOS release runner after `xcodebuild archive` and before distributing the build. Set `ARCHIVE_PATH` to the same path you passed to `xcodebuild -archivePath`. Check out this SDK at a pinned revision, set `DSYM_UPLOADER` to the path of `scripts/upload-dsym.sh` in that checkout, and make `jq` available on the runner. Pass `TOTONO_ERROR_ARTIFACT_KEY` to the upload step as a CI secret.
+
+```bash
+set -euo pipefail
+shopt -s nullglob
+: "${ARCHIVE_PATH:?Set ARCHIVE_PATH to the release archive path}"
+: "${DSYM_UPLOADER:?Set DSYM_UPLOADER to the path of upload-dsym.sh}"
+
+dwarf_files=("$ARCHIVE_PATH"/dSYMs/*.dSYM/Contents/Resources/DWARF/*)
+if [[ -z ${dwarf_files[0]:-} ]]; then
+  echo "No dSYMs found in $ARCHIVE_PATH/dSYMs" >&2
+  exit 1
+fi
+
+for dwarf_file in "${dwarf_files[@]}"; do
+  uuid_lines=$(xcrun dwarfdump --uuid "$dwarf_file")
+  if [[ -z $uuid_lines ]]; then
+    echo "No UUID found in $dwarf_file" >&2
+    exit 1
+  fi
+
+  while read -r label uuid architecture _; do
+    [[ $label == UUID: ]] || continue
+    architecture=${architecture#\(}
+    architecture=${architecture%\)}
+    bash "$DSYM_UPLOADER" "$dwarf_file" "$uuid" "$architecture"
+  done <<< "$uuid_lines"
+done
+```
 
 ## Raspberry Pi and other Linux hosts
 
