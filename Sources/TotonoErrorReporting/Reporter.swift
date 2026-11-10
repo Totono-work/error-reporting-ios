@@ -1,6 +1,13 @@
-import CryptoKit
 import Foundation
+#if os(Linux)
+import Crypto
+import FoundationNetworking
+#else
+import CryptoKit
+#endif
+#if canImport(KSCrashRecording)
 import KSCrashRecording
+#endif
 
 @MainActor
 public final class ErrorReporter {
@@ -33,6 +40,8 @@ public final class ErrorReporter {
         origin: URL,
         key: String,
         environment: String = "production",
+        release: String? = nil,
+        build: String? = nil,
         shouldSend: @escaping ([String: Any]) -> Bool = { _ in true }
     ) throws {
         guard origin.scheme == "https", origin.host != nil, origin.user == nil, origin.password == nil,
@@ -45,16 +54,11 @@ public final class ErrorReporter {
         endpoint = url
         self.key = key
         self.environment = Self.clean(environment, limit: 64)
-        release = Self.clean(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown", limit: 100)
-        build = Self.clean(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "", limit: 100)
+        let releaseName = Self.clean(release ?? (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "", limit: 100)
+        self.release = releaseName.isEmpty ? "unknown" : releaseName
+        self.build = Self.clean(build ?? (Bundle.main.infoDictionary?["CFBundleVersion"] as? String) ?? "", limit: 100)
         let scope = SHA256.hash(data: Data((url.absoluteString + key).utf8)).prefix(12).map { String(format: "%02x", $0) }.joined()
-        var directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-            .appendingPathComponent("TotonoErrorReporting", isDirectory: true)
-            .appendingPathComponent(scope, isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        var values = URLResourceValues()
-        values.isExcludedFromBackup = true
-        try directory.setResourceValues(values)
+        let directory = try Self.queueDirectory(scope: scope)
         file = directory.appendingPathComponent("queue.json")
         self.shouldSend = shouldSend
 
@@ -69,6 +73,7 @@ public final class ErrorReporter {
            let saved = try? JSONDecoder().decode([Entry].self, from: data) {
             entries = Array(saved.suffix(50))
         }
+        #if canImport(KSCrashRecording)
         let crash = KSCrashConfiguration()
         crash.installPath = directory.appendingPathComponent("native", isDirectory: true).path
         crash.enableMemoryIntrospection = false
@@ -76,7 +81,33 @@ public final class ErrorReporter {
         crash.userInfoJSON = ["totono_environment": self.environment]
         try KSCrash.shared.install(with: crash)
         importCrashes()
+        #endif
         schedule()
+    }
+
+    private static func queueDirectory(scope: String) throws -> URL {
+        let files = FileManager.default
+        #if os(Linux)
+        let stateHome = ProcessInfo.processInfo.environment["XDG_STATE_HOME"]
+        let base = stateHome.flatMap { $0.hasPrefix("/") ? URL(fileURLWithPath: $0, isDirectory: true) : nil }
+            ?? files.homeDirectoryForCurrentUser.appendingPathComponent(".local/state", isDirectory: true)
+        #else
+        let base = try files.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        #endif
+        let directory = base.appendingPathComponent("TotonoErrorReporting", isDirectory: true)
+            .appendingPathComponent(scope, isDirectory: true)
+        #if os(Linux)
+        let permissions: [FileAttributeKey: Any] = [.posixPermissions: 0o700]
+        try files.createDirectory(at: directory, withIntermediateDirectories: true, attributes: permissions)
+        try files.setAttributes(permissions, ofItemAtPath: directory.path)
+        #else
+        try files.createDirectory(at: directory, withIntermediateDirectories: true)
+        var protectedDirectory = directory
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try protectedDirectory.setResourceValues(values)
+        #endif
+        return directory
     }
 
     public func addBreadcrumb(category: String, message: String) {
@@ -96,7 +127,15 @@ public final class ErrorReporter {
         event["exceptions"] = [[
             "type": Self.clean(String(reflecting: type(of: error)), limit: 160),
             "message": Self.clean(error.localizedDescription, limit: 2048),
-            "frames": Thread.callStackSymbols.prefix(50).map { ["function": Self.clean($0, limit: 256)] },
+            "frames": Thread.callStackSymbols.prefix(50).map { symbol in
+                #if os(Linux)
+                // Absolute addresses change each time the process starts.
+                let frame = symbol.replacingOccurrences(of: #"\s+\[0x[0-9a-fA-F]+\]$"#, with: "", options: .regularExpression)
+                #else
+                let frame = symbol
+                #endif
+                return ["function": Self.clean(frame, limit: 256)]
+            },
         ]]
         event["breadcrumbs"] = breadcrumbs
         if let opaqueUserID { event["user"] = ["id": Self.clean(opaqueUserID, limit: 200)] }
@@ -104,13 +143,21 @@ public final class ErrorReporter {
     }
 
     private func envelope(id: UUID, date: Date, severity: String) -> [String: Any] {
-        [
+        #if os(Linux)
+        let platform = "linux"
+        let operatingSystem = "Linux"
+        #else
+        let platform = "ios"
+        let operatingSystem = "iOS"
+        #endif
+        return [
             "id": id.uuidString.lowercased(), "timestamp": ISO8601DateFormatter().string(from: date),
-            "platform": "ios", "release": release, "build": build, "environment": environment,
-            "severity": severity, "device": ["os": "iOS", "osVersion": ProcessInfo.processInfo.operatingSystemVersionString],
+            "platform": platform, "release": release, "build": build, "environment": environment,
+            "severity": severity, "device": ["os": operatingSystem, "osVersion": ProcessInfo.processInfo.operatingSystemVersionString],
         ]
     }
 
+    #if canImport(KSCrashRecording)
     private func importCrashes() {
         guard let store = KSCrash.shared.reportStore else { return }
         for number in store.reportIDs.suffix(5) {
@@ -189,6 +236,8 @@ public final class ErrorReporter {
         return (event, id, date)
     }
 
+    #endif
+
     private func enqueue(_ event: [String: Any], id: UUID, date: Date) -> Bool {
         if date <= Date().addingTimeInterval(-30 * 86400) || !shouldSend(event) { return true }
         if entries.contains(where: { $0.id == id }) { return true }
@@ -211,7 +260,12 @@ public final class ErrorReporter {
     @discardableResult
     private func persist() -> Bool {
         do {
-            try JSONEncoder().encode(entries).write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+            #if os(Linux)
+            let options: Data.WritingOptions = [.atomic]
+            #else
+            let options: Data.WritingOptions = [.atomic, .completeFileProtectionUntilFirstUserAuthentication]
+            #endif
+            try JSONEncoder().encode(entries).write(to: file, options: options)
             return true
         } catch {
             return false
@@ -264,6 +318,7 @@ public final class ErrorReporter {
         }
     }
 
+    #if canImport(KSCrashRecording)
     private static func hex(_ value: UInt64) -> String { "0x" + String(value, radix: 16) }
 
     private static func stableID(_ value: String) -> UUID {
@@ -273,6 +328,8 @@ public final class ErrorReporter {
         return UUID(uuid: (bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
                            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]))
     }
+
+    #endif
 
     private static func clean(_ value: String, limit: Int) -> String {
         var result = value
